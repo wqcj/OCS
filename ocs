@@ -1,0 +1,393 @@
+// 导入必要的库和模块
+const lib = require('./ocs-lib'); // 假设这是你的基础库
+
+// GLM-4.5 API 配置
+const GLM_API_CONFIG = {
+  apiKey: 'your-glm-api-key',
+  baseURL: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+  model: 'glm-4-plus' // 或 glm-4-0520, glm-4-air 等
+};
+
+// 题目类型定义
+const QUESTION_TYPES = {
+  SINGLE: 'single',      // 单选题
+  MULTIPLE: 'multiple',  // 多选题
+  JUDGEMENT: 'judgement', // 判断题
+  COMPLETION: 'completion' // 填空题
+};
+
+// GLM-4.5 答案生成器
+class GLMAnswerGenerator {
+  constructor(apiConfig = GLM_API_CONFIG) {
+    this.apiConfig = apiConfig;
+  }
+
+  // 构建题目分析的prompt
+  buildQuestionPrompt(question, options, questionType) {
+    const basePrompt = `请仔细分析以下题目并给出准确答案。题目要求：`;
+    
+    const typeInstructions = {
+      [QUESTION_TYPES.SINGLE]: '请从选项中选出唯一正确的答案。',
+      [QUESTION_TYPES.MULTIPLE]: '请从选项中选出所有正确的答案。',
+      [QUESTION_TYPES.JUDGEMENT]: '请判断对错，回答"正确"或"错误"。',
+      [QUESTION_TYPES.COMPLETION]: '请填写合适的答案内容。'
+    };
+
+    return `
+${basePrompt}
+${typeInstructions[questionType]}
+
+题目：${question}
+
+${options ? `选项：\n${options.map((opt, index) => `${String.fromCharCode(65 + index)}. ${opt}`).join('\n')}` : ''}
+
+请直接给出答案，不要添加额外解释。`;
+  }
+
+  // 调用GLM-4.5 API生成答案
+  async generateAnswer(question, options = [], questionType = QUESTION_TYPES.SINGLE) {
+    try {
+      const prompt = this.buildQuestionPrompt(question, options, questionType);
+      
+      const response = await fetch(this.apiConfig.baseURL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.apiConfig.apiKey}`
+        },
+        body: JSON.stringify({
+          model: this.apiConfig.model,
+          messages: [
+            {
+              role: 'user',
+              content: prompt
+            }
+          ],
+          temperature: 0.1, // 低随机性确保答案稳定
+          max_tokens: 500
+        })
+      });
+
+      const data = await response.json();
+      return this.parseGLMResponse(data.choices[0].message.content, questionType);
+    } catch (error) {
+      console.error('GLM API调用失败:', error);
+      throw new Error(`答案生成失败: ${error.message}`);
+    }
+  }
+
+  // 解析GLM返回的答案
+  parseGLMResponse(response, questionType) {
+    const cleanedResponse = response.trim();
+    
+    switch (questionType) {
+      case QUESTION_TYPES.SINGLE:
+        // 解析单选题答案，如 "A" 或 "选项A"
+        return this.parseSingleChoiceAnswer(cleanedResponse);
+      
+      case QUESTION_TYPES.MULTIPLE:
+        // 解析多选题答案，如 "AB" 或 "A,B"
+        return this.parseMultipleChoiceAnswer(cleanedResponse);
+      
+      case QUESTION_TYPES.JUDGEMENT:
+        // 解析判断题答案
+        return this.parseJudgementAnswer(cleanedResponse);
+      
+      case QUESTION_TYPES.COMPLETION:
+        // 直接返回填空内容
+        return cleanedResponse;
+      
+      default:
+        return cleanedResponse;
+    }
+  }
+
+  // 解析单选题答案
+  parseSingleChoiceAnswer(response) {
+    const match = response.match(/[A-D]/);
+    return match ? match[0] : null;
+  }
+
+  // 解析多选题答案
+  parseMultipleChoiceAnswer(response) {
+    const matches = response.match(/[A-D]/g);
+    return matches ? matches.join('') : null;
+  }
+
+  // 解析判断题答案
+  parseJudgementAnswer(response) {
+    return response.includes('正确') || response.includes('对') || response.includes('是') ? '正确' : '错误';
+  }
+}
+
+// 基于GLM的答题处理器
+class GLMQuestionResolver {
+  constructor() {
+    this.generator = new GLMAnswerGenerator();
+  }
+
+  // 核心答题逻辑（保留你原来的结构）
+  async resolve(ctx) {
+    return {
+      async single(question, options, handler) {
+        try {
+          const answer = await this.generator.generateAnswer(
+            question, 
+            options.map(opt => opt.textContent || opt.innerText),
+            QUESTION_TYPES.SINGLE
+          );
+          
+          if (answer) {
+            await handler('single', answer, options.find(opt => 
+              opt.textContent.includes(answer) || opt.dataset.value === answer
+            ), ctx);
+            return { finish: true, answer };
+          }
+        } catch (error) {
+          console.error('单选题处理失败:', error);
+        }
+        return { finish: false };
+      },
+
+      async multiple(question, options, handler) {
+        try {
+          const answers = await this.generator.generateAnswer(
+            question,
+            options.map(opt => opt.textContent || opt.innerText),
+            QUESTION_TYPES.MULTIPLE
+          );
+
+          if (answers && answers.length > 0) {
+            for (const answer of answers.split('')) {
+              const matchingOption = options.find(opt => 
+                opt.textContent.includes(answer) || opt.dataset.value === answer
+              );
+              if (matchingOption) {
+                await handler('multiple', answer, matchingOption, ctx);
+              }
+            }
+            return { finish: true, answers };
+          }
+        } catch (error) {
+          console.error('多选题处理失败:', error);
+        }
+        return { finish: false };
+      },
+
+      async judgement(question, options, handler) {
+        try {
+          const answer = await this.generator.generateAnswer(
+            question,
+            ['正确', '错误'],
+            QUESTION_TYPES.JUDGEMENT
+          );
+
+          if (answer) {
+            const matchingOption = options.find(opt => 
+              opt.textContent.includes(answer)
+            );
+            if (matchingOption) {
+              await handler('judgement', answer, matchingOption, ctx);
+              return { finish: true, answer };
+            }
+          }
+        } catch (error) {
+          console.error('判断题处理失败:', error);
+        }
+        return { finish: false };
+      },
+
+      async completion(question, inputs, handler) {
+        try {
+          const answer = await this.generator.generateAnswer(
+            question,
+            [],
+            QUESTION_TYPES.COMPLETION
+          );
+
+          if (answer && inputs.length > 0) {
+            // 对于填空题，可能只有一个输入框或多个输入框
+            if (inputs.length === 1) {
+              await handler('completion', answer, inputs[0], ctx);
+            } else {
+              // 多个填空框的处理逻辑（根据题目情况调整）
+              await handler('completion', answer, inputs[0], ctx);
+            }
+            return { finish: true, answer };
+          }
+        } catch (error) {
+          console.error('填空题处理失败:', error);
+        }
+        return { finish: false };
+      }
+    };
+  }
+}
+
+// DOM操作处理器
+class DOMAnswerHandler {
+  // 处理单选题选择
+  async handleSingle(answer, optionElement, ctx) {
+    if (optionElement) {
+      optionElement.click();
+      await this.delay(500);
+      console.log(`已选择答案: ${answer}`);
+    }
+  }
+
+  // 处理多选题选择
+  async handleMultiple(answer, optionElement, ctx) {
+    if (optionElement && !optionElement.checked) {
+      optionElement.click();
+      await this.delay(300);
+      console.log(`已选择答案: ${answer}`);
+    }
+  }
+
+  // 处理判断题选择
+  async handleJudgement(answer, optionElement, ctx) {
+    await this.handleSingle(answer, optionElement, ctx);
+  }
+
+  // 处理填空题填写
+  async handleCompletion(answer, inputElement, ctx) {
+    if (inputElement) {
+      inputElement.value = answer;
+      inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+      await this.delay(500);
+      console.log(`已填写答案: ${answer}`);
+    }
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// 主工作器（保留你原来的OCSWorker结构）
+class GLMOCSWorker extends lib.CommonEventEmitter {
+  constructor(opts) {
+    super();
+    this.opts = opts;
+    this.resolver = new GLMQuestionResolver();
+    this.handler = new DOMAnswerHandler();
+    this.isRunning = false;
+  }
+
+  async doWork(options) {
+    this.isRunning = true;
+    this.emit('start');
+
+    try {
+      const questionRoots = typeof this.opts.root === 'string' 
+        ? Array.from(document.querySelectorAll(this.opts.root))
+        : this.opts.root;
+
+      for (const questionRoot of questionRoots) {
+        if (!this.isRunning) break;
+
+        const ctx = {
+          root: questionRoot,
+          elements: this.extractQuestionElements(questionRoot),
+          type: this.detectQuestionType(questionRoot)
+        };
+
+        const resolveMethods = await this.resolver.resolve(ctx);
+        
+        switch (ctx.type) {
+          case QUESTION_TYPES.SINGLE:
+            await resolveMethods.single(
+              ctx.elements.question,
+              ctx.elements.options,
+              this.handler.handleSingle.bind(this.handler)
+            );
+            break;
+          
+          case QUESTION_TYPES.MULTIPLE:
+            await resolveMethods.multiple(
+              ctx.elements.question,
+              ctx.elements.options,
+              this.handler.handleMultiple.bind(this.handler)
+            );
+            break;
+          
+          case QUESTION_TYPES.JUDGEMENT:
+            await resolveMethods.judgement(
+              ctx.elements.question,
+              ctx.elements.options,
+              this.handler.handleJudgement.bind(this.handler)
+            );
+            break;
+          
+          case QUESTION_TYPES.COMPLETION:
+            await resolveMethods.completion(
+              ctx.elements.question,
+              ctx.elements.inputs,
+              this.handler.handleCompletion.bind(this.handler)
+            );
+            break;
+        }
+
+        await this.delay(1000); // 题目间延迟
+      }
+
+      this.emit('complete');
+    } catch (error) {
+      this.emit('error', error);
+    } finally {
+      this.isRunning = false;
+    }
+  }
+
+  // 提取题目元素
+  extractQuestionElements(root) {
+    return {
+      question: root.querySelector('.question-text, .title, [class*="question"]')?.textContent || '',
+      options: Array.from(root.querySelectorAll('.option, .choice, [class*="option"]')),
+      inputs: Array.from(root.querySelectorAll('input[type="text"], textarea'))
+    };
+  }
+
+  // 检测题目类型
+  detectQuestionType(root) {
+    // 根据DOM结构判断题目类型
+    if (root.querySelector('input[type="radio"]')) return QUESTION_TYPES.SINGLE;
+    if (root.querySelector('input[type="checkbox"]')) return QUESTION_TYPES.MULTIPLE;
+    if (root.querySelector('input[type="text"], textarea')) return QUESTION_TYPES.COMPLETION;
+    
+    // 判断题通常有"正确"/"错误"选项
+    const text = root.textContent;
+    if (text.includes('正确') || text.includes('错误') || text.includes('对') || text.includes('错')) {
+      return QUESTION_TYPES.JUDGEMENT;
+    }
+    
+    return QUESTION_TYPES.SINGLE; // 默认按单选题处理
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  stop() {
+    this.isRunning = false;
+    this.emit('stop');
+  }
+}
+
+// 使用示例
+const worker = new GLMOCSWorker({
+  root: '.question-container' // 题目容器的选择器
+});
+
+// 开始答题
+worker.doWork().then(() => {
+  console.log('答题完成');
+});
+
+module.exports = {
+  GLMOCSWorker,
+  GLMAnswerGenerator,
+  GLMQuestionResolver,
+  DOMAnswerHandler,
+  QUESTION_TYPES
+};
